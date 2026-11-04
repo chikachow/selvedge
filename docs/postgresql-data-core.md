@@ -1,146 +1,53 @@
 # PostgreSQL data core
 
-Status: proposed data model and transaction interface, 2026-11-04. The user wants
-to define application consistency through PostgreSQL while keeping the solution
-simple and using established terminology. This develops the
-[current architecture](design.md); it is not a production migration or an
-implementation of the GraphQL checker.
+Design specification, 2026-11-04. This document defines the relational model and
+publication transaction for the [PostgreSQL-backed architecture](design.md).
+The guarantees below are implementation requirements supported by isolated
+experiments; no production schema or application is implemented.
 
-## Domain and consistency requirements
+## Guarantees and enforcement
 
-A **registry revision** records one accepted graph configuration and its generated
-artifacts. A **subgraph publication** records an accepted update to one subgraph.
-A **source revision** identifies source code; it does not identify generated SDL
-or a database revision. An **idempotency key** identifies a caller's request across
-retries. A digest identifies bytes, not the order of publications. These meanings
-follow the [glossary](../GLOSSARY.md) and standard database terminology.
+| Guarantee | Enforcement |
+| --- | --- |
+| A committed registry revision contains its complete inputs, outputs and publication receipt | One transaction inserts the revision, publications and membership, then advances the graph's current revision |
+| The current revision belongs to its graph; accepted history cannot branch or rewind through the publication API | Composite foreign keys, a unique predecessor constraint and a locked current-revision check |
+| Each revision includes at most one publication of each subgraph | Membership primary key and composite foreign keys |
+| Concurrent publication cannot overwrite a participant whose expected publication changed | Per-subgraph preconditions checked at acceptance |
+| A batch is accepted in full or has no effect | All participants share one graph transaction; no partial retry or participant omission |
+| Repeating an accepted request returns its original result without changing current state | Graph-scoped unique idempotency key, immutable request binding and receipt lookup before freshness checks |
+| Accepted history, including old memberships and artifact bytes, is immutable to ordinary application access and has no automatic expiry | Runtime access is limited to reads and explicitly granted operations; direct table writes are denied |
+| An empty graph remains a valid registry state | A real current revision with zero membership rows and null composed artifacts |
 
-The data core must preserve these properties:
+These guarantees assume a trusted application supplies the exact evaluated inputs
+and outputs. SQL does not establish Federation validity, authorization or artifact
+derivation. Database administrators remain trusted, and crash durability and
+recovery depend on the deployment configuration.
 
-1. Every visible registry revision has its complete inputs and outputs. Zero
-   subgraphs is valid registry state; that revision has no composed artifacts.
-2. The current registry revision belongs to the graph and advances only through
-   publication. Gateway rollback selects a historical artifact without rewinding
-   registry history.
-3. Each revision includes a subgraph at most once and refers to its exact retained
-   publication. Unchanged subgraphs keep their existing publication references.
-4. Publishing a batch changes all its participants together. An intervening change
-   to a participant cannot be silently overwritten.
-5. A repeated accepted request returns its original revision. Reusing its
-   idempotency key for different requested changes is an error.
-6. Ordinary application access cannot modify accepted history, including adding
-   members to an existing revision.
+## Relational model
 
-These requirements justify relational keys, foreign keys, restricted privileges
-and one publication function. They do not require a queue, event-sourcing system,
-separate receipt ledger or arbitrary executable checks inside the database.
-
-## Four relations
-
-| Relation | Purpose and principal fields |
+| Relation | Contents |
 | --- | --- |
 | `graphs` | Graph identity and `current_revision_id` |
-| `registry_revisions` | Revision identity, previous registry revision, idempotency key and request binding, complete generated artifacts, checker identity, retained graph-level inputs, report and publication metadata |
-| `subgraph_publications` | Subgraph name, accepting registry revision, exact SDL, source provenance and artifact-defining subgraph configuration such as routing |
-| `revision_subgraphs` | The subgraph publications included in each registry revision |
+| `registry_revisions` | Revision UUID, predecessor, idempotency key, bound request, graph-level inputs, exact generated artifacts, checker identity, report and publication metadata |
+| `subgraph_publications` | Subgraph name, accepting registry revision, exact SDL, source provenance and artifact-defining configuration such as routing |
+| `revision_subgraphs` | The exact subgraph publications included in each registry revision |
 
-Use UUIDs for registry revision identities. A subgraph publication is identified
-by `(graph_id, subgraph_name, accepted_revision_id)`; no extra version counter or
-schema-content identifier is needed. Its accepting registry revision supplies
-the version used by an optimistic-concurrency precondition.
+A subgraph publication is identified by
+`(graph_id, subgraph_name, accepted_revision_id)`. Its accepting registry revision
+is also the version used by optimistic concurrency. No independent version
+counter or content-addressing subsystem is required. Membership references avoid
+copying unchanged SDL and give foreign keys authoritative input records to check.
 
-For example:
+A source revision identifies source code; an artifact digest identifies bytes.
+Neither identifies publication order. Every newly accepted subgraph publication
+receives a new identity even if its SDL is unchanged. Otherwise an intervening
+publication or an A-to-B-to-A content change could satisfy an obsolete condition.
+An accepted-request retry creates neither a revision nor a publication.
+See the [glossary](../GLOSSARY.md) for domain terminology.
 
-| Registry revision | Products publication | Reviews publication |
-| --- | --- | --- |
-| R12 | accepted in R12 | accepted in R9 |
-| R13, updating Reviews | accepted in R12 | accepted in R13 |
+### Keys and constraints
 
-R12/R13 are explanatory labels, not an additional numeric versioning scheme.
-A new Products publication advances its reference even if its SDL is unchanged.
-Otherwise, intervening source changes or an A-to-B-to-A schema change could make
-an old precondition appear current. A retry of the same accepted request creates
-neither a new registry revision nor a new subgraph publication.
-
-The fourth relation separates the identity of an accepted input from the graph
-revisions that use it. This gives a foreign key one authoritative input record
-to reference and avoids copying unchanged SDL. It is not a general blob store
-or content-addressing subsystem.
-
-## Optimistic concurrency
-
-The user selected per-subgraph conditions with automatic retry across unrelated
-publications. A replacement or removal identifies the subgraph publication the
-caller observed. The service preserves that expected revision throughout retries;
-it must not refresh it to overwrite an intervening publication. A batch carries
-one condition per participant, and all must hold for the batch to be accepted.
-
-For additions, the agreed behavior is ordinary create-if-absent: the named
-subgraph must be absent when the request is accepted. This allows recomposition
-after unrelated changes without adding another relation or a graph-wide caller
-precondition. It does permit a never-accepted delayed addition after another
-request creates and removes that name, provided the delayed request is still
-authorized. This consequence is accepted. Preventing that recreation would
-require retained deletion versions, history inspection, or a fixed graph revision
-that also conflicts with unrelated changes. Those mechanisms are not part of
-the selected contract.
-
-Two revisions have different jobs:
-
-- The caller's **expected subgraph publication** prevents overwriting that
-  participant. It belongs to the immutable request and idempotency binding.
-- The service's **evaluated registry revision** identifies the complete graph
-  used for composition. PostgreSQL must compare it with the current revision
-  before accepting the result. It can change during recomposition and is not
-  part of the caller's immutable request.
-
-For example, an update to Products expects its publication accepted in R12.
-Reviews advances the graph to R13 while Products remains at that publication.
-The service can recompose against R13 and retry with Products still expecting
-R12. If Products itself has advanced, the original request conflicts even when
-the new SDL happens to match the old bytes.
-
-### HTTP representation
-
-Prefer one publication request shape for both single changes and batches:
-each replacement/removal carries its `expected_revision`, while an explicit
-addition requires absence. An unconditional upsert would erase this distinction.
-Use an application-level `409 Conflict` when a participant's condition fails;
-an internal graph-revision mismatch instead triggers bounded reconstruction and
-rechecking. A successful check does not reserve the graph or authorize a write.
-
-Standard `ETag`/`If-Match` is appropriate if reads and mutations target the same
-individual subgraph resource. A strong ETag can include its publication identity
-and representation version; it must cover all represented data and variants,
-not just SDL. The service must not include unrelated changing graph data in that
-representation while promising an unchanged strong ETag. A failed `If-Match`
-produces `412 Precondition Failed`; a required but missing condition can produce
-`428 Precondition Required`.
-[HTTP validators and conditions](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.8),
-[428](https://www.rfc-editor.org/rfc/rfc6585.html#section-3).
-
-However, an `If-Match` list offers alternatives for one target, not conditions
-on multiple subgraphs. Nor can `If-None-Match: *` on a publication collection
-mean that a particular subgraph is absent. The shared publication endpoint
-therefore uses explicit per-change conditions rather than a custom revision
-header or extra single-subgraph endpoints just to use conditional headers.
-An expected revision is still ordinary optimistic concurrency; its transport
-does not change the database check.
-[Conditional requests](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1).
-
-This also keeps accepted-request recovery consistent: matching idempotency keys
-return the original receipt without performing another mutation. Raw HTTP
-conditional creation needs separate care because failed `If-None-Match` on an
-unsafe method requires `412`, whereas `If-Match` explicitly allows recognizing
-an already successful request. Do not silently treat them as the same rule.
-Recovered results identify their historical accepted revision; they must not
-advertise its ETag as the current subgraph's validator.
-[If-Match](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.1),
-[If-None-Match](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.2).
-
-## Declarative constraints
-
-The essential keys and references are:
+The following is a constraint sketch, not an executable migration:
 
 ```text
 graphs
@@ -148,6 +55,7 @@ graphs
   current_revision_id NOT NULL
   FOREIGN KEY (graph_id, current_revision_id)
     -> registry_revisions (graph_id, revision_id)
+    DEFERRABLE INITIALLY DEFERRED
 
 registry_revisions
   PRIMARY KEY (graph_id, revision_id)
@@ -171,229 +79,331 @@ revision_subgraphs
        (graph_id, subgraph_name, accepted_revision_id)
 ```
 
-Required identity and request-binding fields are `NOT NULL`. The supergraph and
-public API schema artifacts are both null for an empty revision and both present
-for a nonempty revision. A row-level check requires them to be null together;
-the creation/publication operation enforces their correspondence with membership.
-`previous_revision_id` is null only for the initial revision, as enforced by the
-creation/publication operations. Composite foreign keys prevent a reference from
-crossing graphs or selecting another subgraph's publication. The membership
-primary key prevents duplicate subgraphs within one revision.
+Identity and request-binding fields are non-null. Only the initial revision has
+a null predecessor, as enforced by graph creation and publication. Composite
+foreign keys prevent references across graphs or to another subgraph's
+publication. The unique predecessor constraint permits at most one initial
+revision and one successor per revision; it does not establish membership
+completeness or replace the publication function's current-revision check.
 
-The unique previous-revision constraint permits at most one initial revision and
-one successor to each revision. It adds one unique index and encodes the required
-linear accepted history directly. It does not replace the function's current-
-revision check or prove that membership is complete. `NULLS NOT DISTINCT` requires
-PostgreSQL 15 or later; the experiment used PostgreSQL 18.6. The supplied database
-version still needs confirmation before implementing a migration.
+The deferred current-revision reference permits graph creation and its initial
+revision in one transaction. The column remains non-null, so creation cannot
+commit a graph without a revision. Ordinary publication requires an existing
+graph; bootstrap is a separate authorized operation.
 
-The graph's current-revision foreign key can be deferred until transaction commit
-to support atomic graph creation with its first valid revision. Its column remains
-non-null: creation must not leave a committed graph without a revision. Ordinary
-publication requires an existing graph; it cannot silently bootstrap missing
-history. Graph creation remains a separately authorized operation.
+A row-level `CHECK` requires the supergraph and public API schema artifacts to be
+null together. The creation/publication operation additionally requires both to
+be absent exactly when membership is empty. Cross-row invariants belong in
+relational constraints or the restricted operation, not queries hidden inside
+`CHECK` functions. `NULLS NOT DISTINCT` requires PostgreSQL 15 or later; the
+deployment version remains to be confirmed.
+[PostgreSQL constraints](https://www.postgresql.org/docs/18/ddl-constraints.html).
 
-Use `CHECK` for conditions on a row's own values, such as allowed byte lengths
-once the actual input limits are selected. Do not hide queries of other rows
-inside `CHECK` functions. PostgreSQL documents the limits of cross-row checks
-and provides foreign keys and unique constraints for relational integrity.
-[PostgreSQL constraints](https://www.postgresql.org/docs/current/ddl-constraints.html).
+### Stored bytes
 
-Store exact SDL and generated artifacts as `bytea`. Compute artifact digests from
-the stored bytes, using PostgreSQL's binary hash functions if convenient, rather
-than trusting a separately supplied digest. JSONB is appropriate for structured
-diagnostics and flexible provenance/configuration fields; graph membership and
-publication identities remain relational. Original input bytes that must be
-retained exactly are not reconstructed from JSONB.
-[Binary data](https://www.postgresql.org/docs/current/datatype-binary.html),
-[binary hash functions](https://www.postgresql.org/docs/current/functions-binarystring.html),
-[JSON storage](https://www.postgresql.org/docs/current/datatype-json.html).
+Use `bytea` for exact SDL and generated artifacts. Compute digests from the
+stored bytes rather than trusting independently supplied hashes. Use JSONB for
+structured diagnostics and flexible provenance/configuration, but do not
+reconstruct byte-preserved inputs from JSONB. Graph membership and publication
+identity remain relational.
+[Binary data](https://www.postgresql.org/docs/18/datatype-binary.html),
+[binary hashes](https://www.postgresql.org/docs/18/functions-binarystring.html),
+[JSON storage](https://www.postgresql.org/docs/18/datatype-json.html).
 
-## One database publication function
+## Optimistic concurrency
 
-The application loads an immutable revision, applies authorized requested changes,
-and runs the checker before opening the publication transaction. It supplies the
-evaluated registry revision, original request, and generated result to a narrowly
-scoped PostgreSQL function.
+Caller conditions apply to subgraphs, not the entire graph:
+
+| Requested operation | Condition at acceptance |
+| --- | --- |
+| Add | The subgraph name is absent from the current revision |
+| Replace | The current publication equals the caller's expected publication |
+| Remove | The current publication equals the caller's expected publication |
+
+A batch has one condition per participant; all must hold. Preserve these
+conditions throughout retries. In particular, refreshing an expected publication
+to make a stale request succeed would authorize an overwrite the caller did not
+request. A new removal of an already absent subgraph conflicts; a retry of an
+accepted removal recovers its original receipt.
+
+The **evaluated registry revision** serves a separate purpose: it identifies the
+complete graph used for checking. It must still be current when the transaction
+accepts the result. An unrelated publication invalidates that evaluation, so the
+service reloads, recomposes and retries with the original subgraph conditions.
+The evaluated revision may change during retry and is excluded from request
+binding; the caller's conditions remain fixed and bound.
+
+For example, Products' publication was accepted in R12. Reviews advances the
+graph to R13 without changing Products. An update expecting Products at R12 can
+be recomposed against R13 and accepted. If Products has advanced, that request
+conflicts even if the new SDL matches the old bytes. R12/R13 are illustrative
+labels, not an additional sequence-number scheme.
+
+**Create-if-absent trade-off:** a never-accepted delayed addition may succeed
+after another request creates and removes the same name, provided it remains
+authorized. This is intentional: the condition describes current absence, not
+absence throughout an interval. Preventing that recreation would require
+retained deletion versions, history inspection or a graph-wide precondition
+that also rejects unrelated changes. Those mechanisms are excluded.
+
+### HTTP encoding
+
+The proposed publication API uses explicit per-change conditions for both single
+updates and batches: replacements/removals carry `expected_revision`; additions
+require absence. A failed participant condition returns `409 Conflict`. Internal
+graph-revision conflicts trigger bounded reconstruction instead. Successful
+checking neither reserves state nor grants publication authority.
+
+`ETag`/`If-Match` is appropriate for direct mutations of an individual subgraph
+resource. A strong ETag must identify its complete representation, including
+variants, rather than merely hash SDL. However, an `If-Match` list expresses
+alternatives for one target, not simultaneous conditions on several subgraphs.
+`If-None-Match: *` on a publication collection likewise cannot express absence
+of a particular subgraph. Explicit per-change conditions avoid extra endpoints
+or a custom revision header solely to represent a batch.
+[HTTP validators](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.8),
+[conditional requests](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1).
+
+This interface also separates receipt recovery from HTTP conditional creation:
+failed `If-None-Match` on an unsafe method requires `412`, whereas `If-Match`
+permits recognizing an already successful request. Recovered receipts identify
+the historical accepted revision; they must not present its ETag as the current
+subgraph's validator.
+[If-Match](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.1),
+[If-None-Match](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.2).
+
+## Publication transaction
+
+The application authenticates the caller, validates the request binding and
+checks for an existing accepted receipt **before recomposition**. A matching
+receipt is returned subject to result-access authorization; replay does not
+require the old request to pass today's checker. A missing receipt is not proof
+that another attempt cannot still commit.
+
+For a new attempt, load an immutable registry revision, assemble only authorized
+changes and run the checker outside the write transaction. Reading its identity
+and then its immutable rows does not require a long read transaction. Supply the
+evaluated revision, bound request and exact generated result to one restricted
+publication function.
 
 At `READ COMMITTED`, the function:
 
 1. Locks the graph row with `SELECT ... FOR UPDATE`.
-2. In a separate statement after acquiring that lock, looks up the idempotency
-   key. If already accepted, verifies the original request binding and returns
-   that revision. Changed request contents fail without modifying any record.
-3. Verifies that the current registry revision is the evaluated revision, and
-   that replacements/removals still refer to their expected publications and
-   additions are absent.
-4. Allocates a fresh registry revision and inserts the complete revision result
-   and any new subgraph publications. It derives membership from the previous
-   revision plus explicit additions, replacements and removals, preserving all
-   untouched publications. Removal omits membership from the new revision;
-   it does not delete the historical publication or its earlier memberships.
-5. Advances `graphs.current_revision_id` to that new revision.
+2. In a separate statement after acquiring the lock, repeats the idempotency
+   lookup. A matching accepted request returns its original revision; changed
+   request contents fail. This handles acceptance racing with the application
+   lookup or evaluation.
+3. Checks that the current revision is the evaluated revision and verifies every
+   participant's original condition.
+4. Allocates a fresh revision UUID and inserts the complete result, new subgraph
+   publications and derived membership. Untouched publications are preserved;
+   removal omits membership only from the new revision.
+5. Advances `graphs.current_revision_id`. All writes commit together.
 
-All writes commit together. Failed preconditions produce no writes; exceptions
-roll back the statement. A function result is provisional until the enclosing
-transaction commits. The application must not report successful publication
-merely because it received a returned revision ID.
+An uncaught error rolls back the operation; failed conditions produce no partial
+revision or batch. The returned revision ID is provisional until the enclosing
+transaction commits. Report acceptance only after commit succeeds, or recover it
+through the accepted-request lookup if the commit outcome is uncertain.
 
-The row lock covers only this short database operation. Composition, tool execution
-and external calls occur outside it. Readers can continue using immutable
-revisions. Different graphs have separate rows to lock. Successive statements at
-`READ COMMITTED` and a `VOLATILE` modifying function allow the post-lock lookup to
-observe a preceding publisher's committed request.
-[Row locks](https://www.postgresql.org/docs/current/explicit-locking.html),
-[transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html),
-[function volatility](https://www.postgresql.org/docs/current/xfunc-volatility.html).
+The graph lock covers only the database operation. Different graphs use different
+locks; composition and external calls never hold one. A modifying `VOLATILE`
+function at `READ COMMITTED` obtains fresh snapshots for successive statements,
+allowing the post-lock lookup to observe the preceding publisher's commit.
+[Row locks](https://www.postgresql.org/docs/18/explicit-locking.html),
+[isolation](https://www.postgresql.org/docs/18/transaction-iso.html),
+[function volatility](https://www.postgresql.org/docs/18/xfunc-volatility.html).
 
-An intervening unrelated publication requires the application to reload and
-recompose. It preserves the original subgraph preconditions. A changed participant
-requires caller resolution; the service must not replace that precondition with
-the latest value just to make the write succeed. The entire batch remains intact.
+`SERIALIZABLE` cannot prove that earlier, external composition used the current
+graph; the evaluated-revision check remains necessary. A conditional `UPDATE`
+could implement acceptance, but zero affected rows is not an SQL error and would
+require explicit rollback of preceding inserts. The row-lock sequence checks
+eligibility before mutation and makes that failure path explicit.
+[UPDATE](https://www.postgresql.org/docs/18/sql-update.html).
 
-`SERIALIZABLE` does not establish that composition performed before the transaction
-used the current graph. The expected revision check is still necessary. A
-conditional `UPDATE` is another correct implementation, but requires checking its
-affected-row count and rolling back all preceding inserts when it updates nothing.
-Zero affected rows are not an SQL error. The short row-lock sequence establishes
-eligibility before writing and makes that failure path easier to reason about.
-[UPDATE behavior](https://www.postgresql.org/docs/current/sql-update.html).
+## Idempotency and access control
+
+Bind each graph-scoped idempotency key to the stable authenticated publishing
+identity, exact requested changes and source claims, and original subgraph
+conditions. The identity must survive legitimate authentication-token renewal
+and transport retries. Its precise mapping is part of the request contract.
+Do not bind the changing evaluated revision or generated outputs.
+
+Compare the retained normalized request, or compute its fingerprint inside the
+trusted operation. Never accept an unchecked caller hash as proof of equality.
+The function derives inserted subgraph inputs from the same bound request, not
+an independently supplied change list. Possession of a key grants neither
+publication authority nor access to its receipt.
+
+After uncertain commit, retry with the same key and request. The graph lock and
+repeated lookup serialize competing attempts and recover an accepted result even
+when later revisions are current. An unreachable writer leaves the outcome
+unknown; absence on a lagging replica does not establish non-acceptance. Rejected
+requests create no durable receipt or reserved key. There is no background
+completion promise.
+
+The runtime role has read access and narrowly granted function execution, but no
+direct `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` privileges. Denying only updates
+and deletes would still permit insertion into an already accepted revision.
+Use a non-login owning role and a `SECURITY DEFINER` function with schema-qualified
+references, a trusted `search_path`, revoked default `PUBLIC` execution and
+explicit grants. The runtime role must not own or inherit ownership of the tables.
+These controls protect against ordinary application mutations, not trusted owner
+or administrator actions.
+[Function security](https://www.postgresql.org/docs/18/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY),
+[privileges](https://www.postgresql.org/docs/18/ddl-priv.html).
+
+## Schema management
+
+Use [pgschema](https://www.pgschema.com/) for declarative schema management.
+Version-controlled SQL describes the desired schema; pgschema derives an ordered
+DDL plan against the target. Generate and inspect a target-specific saved plan,
+then apply it with the same pinned tool version and fingerprint validation enabled.
+The desired SQL is authoritative; generated plans are deployment artifacts, not
+a separately maintained sequence of handwritten schema migrations.
+[Planning](https://www.pgschema.com/cli/plan),
+[applying saved plans](https://www.pgschema.com/cli/apply).
+
+The tooling boundary must preserve the ownership and privilege model above:
+
+| Managed by pgschema | Established outside pgschema |
+| --- | --- |
+| Supported tables, constraints, functions and explicit object grants | Database/schema creation, roles and membership, object ownership and global default privileges |
+
+Unsupported ownership and global-default statements are ignored with warnings;
+they must not be mistaken for enforced desired state. New objects belong to the
+effective applying role. Migration access is separate from runtime access and
+must establish the designated non-login owner without granting ownership to the
+runtime role. The concrete connection/role-switching mechanism needs validation.
+[Supported scope and exclusions](https://www.pgschema.com/syntax/unsupported).
+
+Before creating functions, trusted bootstrap must revoke the global default
+`EXECUTE` grant to `PUBLIC` for the effective object-creating role. Membership in
+the designated owner role alone does not apply its defaults; per-schema revocation
+cannot remove a global default grant. Explicit function ACLs remain managed. Verify
+ownership, `SECURITY DEFINER`, trusted `search_path`, execution grants and denied
+runtime table writes after applying changes; pgschema's schema fingerprint does
+not cover its unmanaged administrative state.
+[PostgreSQL default privileges](https://www.postgresql.org/docs/18/sql-alterdefaultprivileges.html).
+
+A schema apply is **not globally atomic**: pgschema uses transaction groups, and
+operations such as concurrent indexes run outside a transaction. A later failure
+can leave earlier groups committed. Schema rollout therefore needs explicit
+handling of partial application, DDL locks, data backfills and compatibility with
+active application versions. Publication's atomicity guarantee does not extend
+to schema deployment. A generated diff alone does not establish safe data
+transformation or preserve accepted history.
+[Transaction handling](https://www.pgschema.com/cli/apply).
+
+Renames require explicit treatment: pgschema does not infer them or manage data
+state. Inspect drop/recreate operations and sequence necessary backfills;
+reverting desired SQL cannot recover deleted accepted history.
+[Data migrations](https://github.com/pgplex/pgschema/blob/v1.13.4/docs/workflow/data-migration.mdx),
+[rollback](https://www.pgschema.com/workflow/rollback).
+
+The compatibility review inspected pgschema v1.13.4 source and examples; it did
+not execute this schema through pgschema. Upstream fixtures cover
+[function security settings](https://github.com/pgplex/pgschema/blob/v1.13.4/testdata/diff/create_function/issue_335_search_path_rewrite/plan.sql)
+and [null-aware uniqueness](https://github.com/pgplex/pgschema/blob/v1.13.4/testdata/diff/create_table/add_unique_constraint_nulls_not_distinct/plan.sql).
+Before implementation, pin the tool and PostgreSQL versions and verify fresh
+installation, upgrade convergence, privilege bootstrap and partial-failure
+recovery on a representative database. Verify cyclic foreign-key creation order:
+deferred row checks do not defer DDL name resolution. No schema files or migration
+pipeline exist yet.
 
 ## Empty graphs
 
-Graph creation can commit an initial registry revision with zero membership rows.
-Removing the last subgraph similarly creates an empty revision. Both retain the
-graph's identity and a non-null current revision; an empty graph is distinct from
-a missing graph. The same four relations support these transitions.
+Creation may commit an initial revision with zero membership rows. Removing the
+last subgraph similarly creates an empty revision while retaining graph identity,
+non-null current revision, historical memberships, inputs and artifacts. Empty
+and nonexistent graphs are distinct states.
 
-For an empty revision, store SQL `NULL` for both composed artifacts and expose
-their absence explicitly. Do not substitute zero-byte SDL or reuse an earlier
-revision's artifact. Input validation and authorization still apply; composition
-is reported as unavailable for an empty graph, not as a successful Federation
-composition. Comparisons needing an absent API schema are also unavailable,
-not successful compatibility checks. The membership removal remains visible
-in the change report.
+An empty revision stores SQL `NULL` for both composed artifacts. It must not use
+zero-byte SDL, borrow a historical artifact or introduce a synthetic service.
+Input validation and authorization still apply. Composition and comparisons
+requiring an absent API schema are reported as unavailable, never as successful
+checks; the membership changes remain visible in the report.
 
-Direct experiments with `@apollo/composition@2.14.4`, `@apollo/gateway@2.14.4`
-and `graphql@16.14.2` found that zero-subgraph composition fails with `NO_QUERIES`.
-Gateway's local and introspection composition paths reject empty service lists;
-empty SDL also fails. An empty `Query` object is not a valid workaround: GraphQL
-requires a query root and at least one field on every object. This supports
-absent artifacts rather than a synthetic service or placeholder field.
+**Compatibility boundary:** returning from an empty to a nonempty revision has
+no immediate-baseline API schema to compare. There is no implicit last-nonempty
+baseline. Deployment comparison can still use explicitly selected historical
+artifacts; whether release policy must require that comparison is an open system
+decision in the [architecture](design.md).
+
+An empty revision cannot be selected as an executable gateway artifact. Earlier
+artifacts remain retrievable, and an already configured gateway retains its
+explicitly selected artifact. Registry removal does not stop that gateway or
+remove its runtime dependency on deployed subgraphs. Adding subgraphs resumes
+ordinary composition and artifact production.
+
+## Trade-offs and unresolved details
+
+| Choice | Benefit | Cost or limit |
+| --- | --- | --- |
+| Relational immutable snapshots | Foreign keys validate membership references; unchanged SDL is reused | The publication operation must construct complete membership; rows grow with accepted revisions |
+| Short graph-row lock | Simple atomic acceptance and receipt recovery without long-running composition locks | Final writes serialize per graph; contention may require repeated composition |
+| Per-subgraph conditions | Unrelated publication can retry automatically | The complete graph must still be reevaluated; retries need a bound |
+| Create-if-absent | No tombstones or historical absence protocol | A never-accepted delayed addition can recreate a removed name |
+| Inputs and outputs in one database transaction | Acceptance and artifact availability cannot diverge through a second storage write | Database storage and backups include generated artifacts; no automatic pruning |
+| Restricted database function | One complete mutation interface protects accepted history | Bootstrap and schema migrations require separate trusted operations; administrators remain trusted |
+
+Before implementation, specify:
+
+- PostgreSQL deployment version, write durability, failover behavior, backup and
+  restore procedures, acceptable recovery point and handling of lost accepted
+  records. Restoring an older database can erase acknowledged receipts;
+  idempotency alone cannot reconstruct them or authorize automatic replay.
+- The complete request schema, stable publisher identity, canonical equality
+  rules, binary encoding and mapping between API conditions and stored inputs.
+- Input/artifact size limits, transaction and checker timeouts, contention retry
+  limits and the API response when an attempt exhausts its budget.
+- Authorized graph creation and the pgschema/bootstrap deployment procedures
+  above, preserving the same history and reference invariants.
+
+Authentication, source-release selection, configuration lifetime and checker
+rollout remain application concerns described in the [architecture](design.md).
+The database does not prove artifact derivation, Git ancestry, immediate
+revocation or runtime compatibility. WAL and storage configuration also determine
+which acknowledged commits survive failures.
+[WAL configuration](https://www.postgresql.org/docs/18/runtime-config-wal.html).
+
+## Verification evidence
+
+Isolated local PostgreSQL 18.6 fixtures exercised the four-relation model and
+restricted function. Independent review assessed the design and experiment
+results. The fixtures had no network access or published ports and used temporary
+storage. Observations included:
+
+- Concurrent requests against one evaluated revision accepted at most one new
+  result; matching requests recovered one acceptance. Unchanged additions retried
+  after unrelated advancement, while competing same-name additions conflicted.
+- Changed request bindings and stale participant conditions failed. Accepted
+  replay after later revisions returned the original result without rewinding
+  current state; replay after removal did not recreate membership.
+- Explicit rollback, stale batch participants and errors after inserting the
+  first participant left no partial revision, publication or membership.
+- Runtime history mutation, historical membership insertion, pointer rewind and
+  truncation were denied. Cross-graph references, duplicate initial revisions
+  and duplicate successors violated constraints.
+- Binary outputs and UTF-8 SDL with CRLF survived exact byte round trips. Separate
+  UUID/non-null/deferred-reference creation checks rejected incomplete graphs.
+- Empty → nonempty → empty → recreated lifecycles preserved historical artifacts.
+  Null artifacts serialized to JSON `null`. A never-accepted addition succeeded
+  after intervening creation and removal, confirming the accepted absence rule.
+
+The main fixture used integer revision labels and nullable bootstrap setup;
+separate fixtures checked UUID and non-null creation. Request binding used a
+fixture JSONB shape, not the final API. Composition outputs were fixture bytes;
+recomposition was represented by resubmission against a new evaluated revision.
+Actual response loss, HTTP, authentication, crash durability, failover and
+backup/restore were not exercised. These results establish database-operation
+evidence, not end-to-end or deployed guarantees.
+
+Separate experiments with `@apollo/composition@2.14.4`, `@apollo/gateway@2.14.4`
+and `graphql@16.14.2` rejected zero-subgraph composition with `NO_QUERIES`, empty
+Gateway service lists and empty SDL. GraphQL requires a query root and at least
+one field per object, so an empty `Query` is not a valid workaround. These results
+support absent artifacts; they do not verify the eventual Rust integration or
+the deployed gateway version.
 [Apollo composition errors](https://www.apollographql.com/docs/graphos/schema-design/federated-schemas/reference/errors),
 [GraphQL root types](https://spec.graphql.org/September2025/#sec-Root-Operation-Types),
 [object validation](https://spec.graphql.org/September2025/#sec-Objects.Type-Validation).
-
-An empty registry revision is therefore not selectable as an executable gateway
-artifact. Historical artifacts remain retrievable, and an already configured
-gateway keeps its explicitly selected revision. Removing registry membership
-does not stop that gateway or make its deployed subgraphs unnecessary. Adding
-subgraphs resumes ordinary composition and artifact production. The experiments
-do not establish behavior for the eventual Rust composition integration or an
-unidentified deployed gateway version.
-
-## Idempotency and immutable history
-
-Bind the idempotency key to the graph, authorized submitting identity, requested
-additions/replacements/removals, source claims and original subgraph conditions.
-Authenticate the caller and authorize access to a recovered result; possession
-of a key is not authority. Do not include the discovered registry baseline or newly
-composed outputs: those can change legitimately while retrying after an unrelated
-publication. Retain and compare the actual normalized request, or derive its
-fingerprint inside the trusted operation; do not accept an unchecked caller hash
-as proof that two requests match. The request representation is an interface
-detail to fix before implementing the function, not another persistent lifecycle.
-The function derives inserted subgraph inputs from this same bound request;
-it must not accept an independent change list that could disagree with it.
-
-After an uncertain commit, a retry uses the same key. The function's lock and
-lookup resolve a competing original transaction and return any accepted result,
-even when later publications are current. An unreachable writer leaves the outcome
-unknown; an absent result from a lagging replica does not establish failure.
-Rejected requests need no durable receipt or reserved idempotency key.
-
-The application role can read and execute the publication function, but has no
-direct `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` privileges on these tables.
-Revoking only updates/deletes would still allow it to add a subgraph to an old
-revision. A small `SECURITY DEFINER` function earns its cost by exposing the
-complete operation while denying these partial mutations.
-
-Use a separate non-login owning role, a trusted `search_path`, schema-qualified
-object references, and explicit execution grants after revoking default `PUBLIC`
-execution. The runtime role must not own or inherit ownership of the tables.
-Owners and database administrators remain trusted; this is not tamper-proof
-storage against an administrator. No generic trigger framework or row-level
-security policy is needed for the current single trusted application boundary.
-[Function security](https://www.postgresql.org/docs/current/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY),
-[database privileges](https://www.postgresql.org/docs/current/ddl-priv.html).
-
-## What PostgreSQL does not establish
-
-PostgreSQL can enforce reference integrity, uniqueness, atomic publication and
-the permitted mutation interface. The application still authenticates identities,
-authorizes subgraph changes and result access, validates external input, and
-establishes Federation validity. It must pass the exact evaluated inputs and
-outputs to the database. SQL constraints cannot prove that arbitrary supplied
-supergraph bytes were composed from the recorded subgraphs.
-
-The previous source-order and configuration-lifetime proposals remain explicit
-policy choices; this data model does not imply Git ancestry enforcement or
-instantaneous revocation of admitted work. Gateway activation remains separate
-from the current registry revision.
-
-Database durability also depends on WAL/storage settings and the chosen backup
-and recovery arrangements. Neither transaction isolation nor idempotency can
-recover accepted records lost by restoring an older database.
-[WAL settings](https://www.postgresql.org/docs/current/runtime-config-wal.html).
-
-## Verification
-
-Two independent agents assessed relational integrity and transaction behavior.
-An isolated local PostgreSQL 18.6 container, without network access or published
-ports and using temporary storage, exercised a four-relation fixture and the
-restricted publication function. Observed results:
-
-- Two overlapping different requests evaluated against the same revision accepted
-  exactly one. Matching concurrent requests returned the same accepted revision.
-- Replay after a later publication returned the original revision and output
-  without changing the current revision. Changed request contents were rejected.
-- A fresh graph baseline did not refresh a stale subgraph precondition. An
-  unrelated publication preserved the other subgraph's publication reference.
-- Explicit rollback and an error after inserting the first batch participant
-  left no partial revision, publication or membership.
-- Runtime writes to historical records, insertion of historical membership,
-  current-revision rewind and table truncation were denied. Cross-graph current
-  revision and publication membership violated their foreign keys.
-- Binary output and UTF-8 SDL with CRLF survived exact byte round trips.
-- A separate UUID-based creation fixture committed graph and initial revision
-  together using the deferred foreign key. Missing revision and null current
-  revision cases failed without leaving an incomplete graph.
-- The unique previous-revision constraint rejected a second initial revision and
-  a second successor, including through direct owner-level inserts.
-- An empty-graph fixture exercised creation, addition, removal back to empty,
-  and later recreation. Empty revisions used null artifacts; historical inputs,
-  memberships and exact artifact bytes remained available. SQL-to-JSON conversion
-  represented absent artifacts as JSON `null`.
-- Under the agreed create-if-absent rule, additions retried unchanged requests
-  across unrelated graph changes. Concurrent same-name additions accepted only
-  one request; the other first encountered a changed graph revision, then a
-  presence conflict after reloading.
-- Recovery of an accepted addition after removal returned its original revision
-  without recreating membership. Old replacement/removal conditions failed
-  after same-name recreation. Mixed addition/removal batches remained atomic.
-- A never-accepted delayed addition succeeded after an intervening creation and
-  removal. This verifies the stated limit of ordinary create-if-absent, not
-  protection against that sequence. An earlier experiment also exercised the
-  stricter fixed-graph alternative, which was not selected.
-
-The main transaction fixture used integer revision labels and a nullable bootstrap
-column for convenient setup; the separate creation fixture checked the proposed
-UUID/non-null/deferred-reference combination. Neither fixture is a production
-migration. Request binding used a concrete JSONB fixture request; the final
-application request representation is not yet specified or verified. Composition
-outputs were supplied fixture bytes, and recomposition was represented by
-resubmitting against a new evaluated revision. Actual response loss, HTTP,
-authentication, source-release selection, crashes, failover and backup/restore
-were not tested. These experiments support database-operation claims only;
-the separate library startup/composition results and their limits are recorded
-under [empty graphs](#empty-graphs).
