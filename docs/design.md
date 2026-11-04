@@ -2,10 +2,18 @@
 
 Status: design specification, 2026-11-04. No application implementation exists.
 This document defines the system scope, application contracts and outstanding
-policy decisions. The [PostgreSQL data core](postgresql-data-core.md) owns database
-invariants, concurrency and transaction semantics. [The glossary](../GLOSSARY.md)
-defines domain terms; [decision history](decision-history.md) records the earlier
-alternatives and contracts requiring reconciliation.
+policy decisions. It is the application contract for future implementation.
+
+| Document | Authority |
+| --- | --- |
+| [PostgreSQL data core](postgresql-data-core.md) | Relational invariants, concurrency conditions, request binding and publication transaction |
+| [Operations](operations.md) | Artifact deployment, writer handover, schema management and disaster recovery |
+| [Implementation guidance](implementation.md) | Delivery sequence, required behavioral evidence and limits of existing experiments |
+| [Glossary](../GLOSSARY.md) | Domain terminology |
+| [Decision history](decision-history.md) | Rationale, earlier alternatives and unresolved contract changes |
+
+A design requirement is not evidence that it has been implemented. Open decisions
+below block implementation of the affected contract, not unrelated exploration.
 
 ## Scope and architecture
 
@@ -18,15 +26,14 @@ One service owns registry operations. A shared checker supports both service
 requests and local comparisons using complete graph inputs. Source repositories
 own SDL generation and schema review; registry maintainers own routing, grants
 and validation policy. Source Git revisions are provenance, not registry versions.
-Use pgschema for declarative database schema management; the
-[data core](postgresql-data-core.md#schema-management) defines its scope and the
-separate administrative bootstrap requirements.
+Use pgschema for declarative database schema management through the
+[operator workflow](operations.md#database-schema-management).
 
 | Operation | Contract |
 | --- | --- |
 | Check | Evaluate the complete proposed graph against an identified baseline; return diagnostics bound to the exact inputs. No registry mutation or reservation. |
 | Publish | Accept an authorized update atomically with its inputs, outputs, report, checker identity and receipt, subject to concurrency conditions. |
-| Read | Retrieve an identified accepted revision and its exact retained artifact bytes, subject to access control. |
+| Read | Retrieve an accepted receipt by graph and request key, or an identified revision and its exact retained artifact bytes, subject to result-access authorization. |
 
 The initial scope includes source-PR checks, coordinated subgraph batches,
 optional supplied operation documents and empty graph configurations. It excludes
@@ -35,11 +42,14 @@ runtime drift detection, background publication queue and pluggable storage
 framework. Additional mechanisms require a demonstrated requirement.
 
 Rust is the implementation preference, not a composition-library constraint.
-Reuse Apollo composition and GraphQL Inspector behind narrow integration
-boundaries. The exact engine, language packaging, versions, licences and target
-gateway compatibility must be verified before implementation commits to them.
-Do not implement a replacement analyzer merely to maintain a single-language
-binary.
+Reuse established composition and analysis tools behind one checker boundary.
+Apollo composition and GraphQL Inspector are the reference candidates. First
+prove real composition, API extraction, diffing, operation validation and gateway
+loading with pinned versions and compatible licences. Then choose packaging and
+language boundaries. A Rust service plus a Node helper is an option, not an
+assumed architecture; a helper adds process supervision, protocol and deployment
+cost. Do not build a replacement analyzer merely to retain a single-language
+binary. See the [implementation sequence](implementation.md#implementation-sequence).
 
 ## Significant guarantees and boundaries
 
@@ -49,7 +59,7 @@ These are design obligations, not claims of implemented production behavior.
 | --- | --- |
 | Atomic accepted revisions | The database commits inputs, membership, generated artifacts, report, receipt and current-revision advancement together. No partial batch becomes visible. |
 | Consistent evaluation | The service evaluates one complete immutable baseline and candidate. Acceptance requires the evaluated registry revision still to be current. |
-| Per-subgraph optimistic concurrency | Caller conditions remain fixed across retries. Unrelated publications cause recomposition; a changed participant conflicts. Equal SDL does not imply an unchanged publication. |
+| Optimistic concurrency | Source-only changes preserve per-subgraph caller conditions through unrelated retries. Graph-wide maintained inputs require a fixed expected registry revision. Equal SDL does not imply an unchanged publication. |
 | Recoverable acceptance | A matching accepted request returns its original receipt, even after subsequent publications, without restoring historical state. Recovery depends on retained history and an authoritative writer. |
 | Immutable retained evidence | Ordinary application access cannot alter accepted revisions or append membership to them. Exact inputs and generated bytes have no automatic expiry. Database owners remain trusted; backup durability is separate. |
 | Scoped publication authority | Authentication, operation-specific authorization and trusted validation precede acceptance. Proposals cannot authorize themselves or execute code with publication credentials. |
@@ -65,14 +75,20 @@ operational responsibilities.
 | Component | Responsibilities |
 | --- | --- |
 | Graph checker | Composition, public API comparison, operation validation, Federation change reporting, exact generated outputs and structured diagnostics. |
-| Registry service | Immutable snapshot loading, authorized candidate assembly, request binding, acceptance/recovery, contention handling and historical reads. |
+| Publication application module | One owner for request capture, authorization, snapshot loading, candidate evaluation, retry, transaction completion and receipt recovery. |
+| Registry reads | Authorized receipt, revision and artifact retrieval; no checker invocation. |
 | PostgreSQL | Referential integrity, uniqueness, atomic mutation and the restricted publication interface. |
 | GitHub adapter and submission client | Actions OIDC authentication, verified report-target association, source evidence and check reporting. Source CI generates SDL and initiates requests/retries. |
 | Gateway deployment | Artifact selection, startup verification, readiness and operational rollback. |
 
-These are logical boundaries within one application, not separate services.
+These are logical boundaries within one application. HTTP and CI adapters map
+transport input and output; they do not each implement publication loops. The
+publication module owns the complete attempt through commit or reconciliation,
+using the [restricted SQL operation](postgresql-data-core.md#publication-transaction).
 The local checker accepts complete graph inputs; the service obtains the baseline
-from the registry and applies only the authorized requested changes.
+from the registry and applies only the authorized requested changes. Avoid generic
+repository/unit-of-work interfaces unless a concrete caller or test boundary
+requires them.
 
 Initial CI authentication uses GitHub Actions OIDC with separate check and
 publication grants. Validate token signature, issuer, audience, lifetime and the
@@ -83,8 +99,8 @@ reporting credentials remain service-side and do not confer registry authority.
 [GitHub OIDC](https://docs.github.com/en/actions/concepts/security/openid-connect).
 
 Authorize every action and batch participant. Permission to update a schema does
-not implicitly permit membership, routing, ownership or policy changes. The exact
-add/remove grant mapping remains open. Bootstrap is separately authorized and
+not implicitly permit membership, routing, ownership, corpus or policy changes.
+The exact grant mapping remains open. Bootstrap is separately authorized and
 cannot derive its authority from the configuration being created.
 
 Capture submitted bytes and verified identity once, validate consumed values at
@@ -148,62 +164,118 @@ static schema assurance.
 
 Source CI generates SDL and requests a check; the service reports the result
 against the verified PR/build target. Repository controls govern merge. After
-merge, authorized CI explicitly
-requests publication. Checking alone confers no publication authority; neither
+merge, authorized CI explicitly requests publication. Checking alone confers no publication authority; neither
 operation creates a mirrored registry PR or durable pending job.
 
-The service authenticates and validates the immutable request, then recovers any
-matching accepted receipt before reevaluating a new candidate. Otherwise it loads
-a complete revision, authorizes and applies all requested changes, and evaluates
-outside the database transaction. The publication function repeats receipt
-lookup and checks the evaluated revision and participant conditions while holding
-the short graph-row lock. Its result becomes acceptance only on commit.
-The [data core](postgresql-data-core.md) defines the exact transaction order.
+### Publication attempt
 
-On an unrelated revision advance, reload, reauthorize and recompose within a
-bounded request budget. Preserve the original request, participant conditions and
-idempotency key; never drop a batch participant or replace a stale condition with
-a current value to force success. Rejected requests create no background work.
-Caller correction or explicit retry is required after a terminal result.
+The publication module owns this sequence; the database transaction is only its
+final mutation boundary.
+
+1. Authenticate, enforce transport limits, and capture immutable request bytes and
+   verified identity. Establish enough of the versioned request envelope to locate
+   the graph/key and compare an accepted binding; do not run today's checker or
+   new-publication policy first.
+2. Look for an accepted receipt on the authoritative writer. Authorize result
+   access before revealing a receipt or its binding. If the binding matches, return
+   the original receipt; a changed binding is an integrity failure. A dedicated
+   receipt read needs only graph/key identification and result-access authorization,
+   not resubmission of a now-obsolete publication payload.
+3. If no receipt is found, validate the new-publication request, load one immutable
+   baseline, check caller conditions, authorize every requested action under the
+   currently admitted controls, and assemble the complete candidate. Load inherited
+   routing, corpus and other graph inputs from that same revision.
+4. Evaluate outside the write transaction. Retain exact candidate inputs, outputs,
+   checker/options identity and diagnostic scope. A check report alone is not a
+   publication authorization or a reusable reservation.
+5. For an eligible candidate, execute the restricted publication operation, which
+   rechecks receipt and concurrency conditions under the graph lock. Commit the
+   outer transaction before returning acceptance. Resolve an uncertain commit
+   through receipt recovery with the same immutable request identity.
+
+On unrelated advancement, repeat recovery, snapshot loading, authorization and
+evaluation within one bounded attempt budget. Never refresh a caller condition,
+change the key, drop a participant or mutate captured input to force success.
+A maintainer's fixed graph-wide condition conflicts on any advance; source-only
+conditions allow retry if every participant still matches. See
+[concurrency](postgresql-data-core.md#optimistic-concurrency).
+
+### Rejection freshness and recovery
+
+Before returning a baseline-dependent semantic rejection, reread the authoritative
+head and look for accepted recovery. If the evaluated revision is still current,
+return diagnostics labelled with that revision. If it advanced, follow the same
+condition/retry loop used after a failed acceptance check. A changed caller
+condition produces a conflict; unchanged source participants are reevaluated.
+Repeated advancement can exhaust the budget and produce an operational outcome.
+Malformed immutable input that cannot depend on the baseline needs no reevaluation.
+This extra read preserves rejection freshness at the observation point; it cannot
+promise that the head will remain unchanged after the response.
+
+An absent receipt at one instant does not prove that another request cannot
+commit later. Every non-accepted outcome below concerns this attempt. It does
+not disprove an earlier uncertain or concurrent acceptance with the same key.
+Where possible, perform accepted-result recovery before returning a failure;
+lost read authorization or an unavailable authoritative writer must not be
+reported as proof of non-acceptance. Callers retain the request identity and use
+receipt reads or an identical retry to reconcile. No failure schedules background
+publication, reserves a rejected key or cancels another admitted attempt.
 
 | Outcome | Caller-visible meaning |
 | --- | --- |
 | Accepted or recovered acceptance | Original accepted revision and receipt; no duplicate mutation. |
-| Participant conflict | A requested condition no longer holds. Resolve the complete request; do not silently overwrite or reduce it. |
-| Semantic rejection | This attempt did not accept; diagnostics identify its candidate/baseline. A concurrent or earlier uncertain attempt may still require recovery using the same request identity. Rejection freshness policy remains open below. |
-| Authorization or binding failure | Authority is insufficient, or an accepted key is being reused for different input. |
-| Operational failure or exhausted contention | Evaluation could not complete; this is not proof of invalid composition. |
-| Unknown acceptance | A commit may have occurred. Preserve the request identity and reconcile through authoritative recovery before claiming failure or creating a new request. |
+| Caller-condition conflict | A requested subgraph or graph-wide condition no longer holds. Resolve the complete request explicitly. |
+| Semantic rejection | This attempt failed input/composition requirements; diagnostics identify candidate, baseline and checker. Baseline-dependent rejection follows the freshness rule above. |
+| Authorization or binding failure | Authority is insufficient, or an accepted key is being reused for different input. A denied receipt read reveals no outcome. |
+| Operational failure or exhausted contention | Evaluation, infrastructure or retry budget prevented completion; this is not invalid composition. |
+| Unknown acceptance | A write may have committed and is not reconciled. Preserve the graph/key and request; do not assert failure or assign a new key to escape uncertainty. |
+
+Compatibility failure remains a reported assessment, with publication eligibility
+governed by the source-owned approval policy described above. It is not an
+unconditional semantic rejection.
 
 Initial graph creation commits a real current revision, possibly with no
 subgraphs. Ordinary publication cannot bootstrap missing history. Removing the
 last subgraph preserves historical memberships and artifacts. Graph retirement,
 physical deletion and identifier reuse require a separate lifecycle contract.
 
+## Maintained inputs and control changes
+
+Subgraph SDL, routing and provenance are retained with their subgraph publication.
+The supplied operation corpus and other graph-wide evaluation inputs belong to the
+registry revision. A source-only request changes only explicitly authorized source
+fields and inherits all other inputs from its evaluated baseline. Replacing a
+subgraph's routing creates a new publication identity even if SDL is unchanged.
+
+Graph-wide corpus or configuration edits use the same publication lifecycle with
+an additional fixed expected registry revision. Mixed schema/configuration batches
+retain each participant condition as well. This deliberately trades automatic
+rebasing of rare maintainer edits for a complete, easily reviewed concurrency rule.
+It prevents overwriting an unseen corpus/configuration edit. Per-subgraph routing
+edits still use the affected publication's condition and explicit routing authority.
+
+Authorization policy and checker releases govern admission; they are not
+self-authorizing graph input. Existing controls must authorize their replacements,
+and repository review must bind the deployed change to the exact approved inputs.
+The mechanism for proving that association remains an open contract. New checker
+behavior must be evaluated separately against retained inputs and outputs before
+activation. The initial operational model is an exclusive writer handover with a
+publication pause; the [handover contract](operations.md#writer-and-control-handover)
+specifies its prerequisites and revocation boundary.
+
 ## Artifact retrieval and gateway deployment
 
-Serve accepted metadata and artifact bytes over authenticated HTTPS. A deployment
-selects a registry revision and verifies its expected artifact identity. The
-artifact is retrieved as stored, without recomposition. Empty revisions have no
-executable artifact and cannot be selected for gateway startup.
+Read serves accepted metadata and exact retained bytes over authenticated HTTPS;
+it does not recompose or silently select the current revision. Artifact read
+permission is separate from publication and receipt-read permission. Possession
+of a key or revision identifier is not authority.
 
-For Apollo JavaScript Gateway, a startup adapter can supply retained SDL through
-`supergraphSdl`. Confirm the actual gateway version and supported composition
-output before committing to that integration.
-[Apollo Gateway interface](https://www.apollographql.com/docs/apollo-server/using-federation/api/apollo-gateway).
-
-| Situation | Required deployment behavior |
-| --- | --- |
-| Startup | Retrieve and verify the selected artifact, initialize the gateway, then become ready. |
-| Registry unavailable at startup | Use a verified prepositioned copy of that same revision, if supplied; otherwise remain unready. |
-| Registry unavailable after startup | Continue with the loaded graph; client operations do not require registry access. |
-| Missing, corrupt or unsupported artifact | Reject initialization/update. Preserve the previous running deployment during rollout. |
-| Historical artifact selected | Verify that deployed subgraphs still support it; retained bytes alone do not establish rollback feasibility. |
-
-Initially use gateway rollout/restart for activation. A cache must not silently
-substitute a different last-successful revision. Whether deployments must always
-bundle the selected artifact to tolerate cold-start outages remains open. Grant
-gateway read access separately from publication access.
+The initial deployment model bundles a selected nonempty revision's artifact,
+identity and digest during deployment preparation. Gateway startup verifies and
+loads that local bundle. Registry credentials and network access are unnecessary
+in the gateway process. Activation uses rollout/restart, and registry publication
+does not trigger activation. The [deployment contract](operations.md#gateway-deployment)
+owns retrieval, integrity, startup and rollback behavior.
 
 ## Design trade-offs
 
@@ -215,7 +287,10 @@ gateway read access separately from publication access.
 | Ordinary create-if-absent | No deletion-version relation or graph-wide condition for additions. | A never-accepted delayed addition can recreate a subsequently removed name while it remains authorized. This is accepted behavior. |
 | Empty revisions without artifacts | Supports initial/transient empty state using supported library behavior. | No executable empty supergraph or automatic API comparison across an empty baseline. |
 | Caller-owned retries | No pending-work inventory or background worker lifecycle. | CI must retain stable request identity and distinguish explicit retry from event redelivery. |
-| Explicit gateway activation | Registry changes do not unexpectedly affect running traffic. | Deployment owns readiness, source-service coordination and rollback feasibility. |
+| Bundled artifact and explicit activation | Cold starts use local verified bytes; gateway execution needs no registry client, credentials or cache fallback. | Deployment preparation owns retrieval and distribution. Revocation cannot retract already distributed bytes; activation requires rollout/restart. |
+| Fixed condition for graph-wide edits | One complete conflict rule for corpus/configuration edits without field-level merge protocols. | Unrelated graph advancement also conflicts and requires explicit maintainer reconsideration. |
+| Exclusive writer handover | One admitted checker/control release at a time without a distributed release-fencing protocol. | Publication pauses during handover; this requires operators to prove old writers and pending transactions are stopped. |
+| Rejection freshness check | A composition failure caused by an obsolete baseline is retried under the same concurrency rules as a successful evaluation. | Extra authoritative reads and possible reevaluation; persistent contention yields an operational result. |
 
 ## Unanswered policy questions
 
@@ -227,32 +302,22 @@ Resolve each affected contract before implementing that path.
 | Question | Earlier contract and proposed alternative |
 | --- | --- |
 | Source ordering | Require registry-enforced Git ancestry, or rely on CI selecting the intended source release? In the latter model, capture publication conditions before the CI release-selection check; freshly rebased old-source requests remain possible. |
-| Rejection freshness | Reevaluate if the registry advances during a failed composition, or return an immediate rejection labelled with its evaluated snapshot? Both avoid acceptance; only the first promises the extra freshness check. |
-| Request identity beyond acceptance | Must rejected-key reuse or different output for identical declared generation inputs be detected? The data core binds accepted requests only; it does not enforce generator determinism or retain rejected bindings. |
-| Authorization lifetime | Must control changes fence in-flight publishers, or may already admitted bounded work finish? Define retry reauthorization, emergency write suspension and the point at which revocation takes effect. |
-| Checker rollout and upgrade assurance | Require exclusive writer cutover and separate proposed-tool evaluation, or allow overlapping trusted checker releases? Recording checker identity does not fence older writers or prove upgrade compatibility. |
-| Membership and maintained-input authority | Which grants permit addition/removal, routing and corpus changes, and mixed schema/configuration batches? Retained artifact-defining inputs must match the evaluated snapshot; proposed grants cannot authorize themselves. |
-| Compatibility across empty state | Is explicit deployment comparison sufficient, or must a publication after an empty revision compare against an identified earlier nonempty revision? No historical comparison is implied by ordinary immediate-baseline checks. |
-| Durability and availability | What RPO/RTO, WAL/storage configuration, failover fencing, restore reconciliation and cold-start behavior are required? Retention and local transaction atomicity alone do not provide these guarantees. |
+| Request identity beyond acceptance | Must rejected-key reuse or different output for identical declared generation inputs be detected? The data core binds accepted requests only; it does not enforce generator determinism or retain rejected bindings. The stronger earlier integrity contract remains unresolved. |
+| Approval and grant mapping | Which verified facts authorize additions/removals, routing, corpus edits, mixed batches and bootstrap? How are exact source/control inputs tied to repository approval? OIDC alone supplies neither proof of generation nor proof of approval. |
+| Compatibility across empty state | Is explicit deployment comparison sufficient, or must publication after an empty revision compare against an identified earlier nonempty revision? No historical comparison is implied by immediate-baseline checks. |
+| Handover feasibility | Can the deployment stop all old writers, reconcile pending transactions and tolerate a publication pause? If not, select and verify a release-fencing mechanism before enabling overlapping releases. No pause-free handover is promised. |
+| Durability and recovery | What RPO/RTO, commit durability, failover fencing and restore reconciliation are required? A restore gap invalidates receipt-absence inference; retained-history policy alone cannot prevent it. |
 
-Implementation also needs a complete request/response schema, normalized binding
-and stable publisher identity, OIDC grant/report-target mapping, input and retry
-limits, PostgreSQL version and privileges/migrations, gateway read credentials,
-and a pinned checker/gateway compatibility matrix. The data core owns the
-persistence-specific details still to be specified.
+These choices are owned by registry maintainers, with source owners for release
+ordering/approval and operators for handover/recovery. The
+[implementation prerequisites](implementation.md#decisions-before-implementation)
+record what must be pinned or specified before each path can ship. No proposed
+simplification silently waives an earlier unresolved guarantee.
 
 ## Verification status
 
-Local PostgreSQL and Apollo probes informed the data core; they are not an
-end-to-end application test suite. Their observed behavior and limits are recorded
-[in the data core](postgresql-data-core.md#verification-evidence). The probes are not shipped
-in this checkout. Documentation review does not verify hosted CI, HTTP, production
-authorization, failover, restoration or an actual gateway deployment.
-
-Before implementation is accepted, exercise representative schemas through check,
-publish and read; race unrelated and same-subgraph changes; lose a commit response;
-verify exact retained bytes; test authorized/unauthorized batches and empty-state
-transitions. Then test the selected gateway's startup/outage behavior, database
-restoration with an acceptance gap, and a checker upgrade under the chosen rollout
-policy. Workload latency, publication contention and retention growth remain
-unmeasured.
+Local PostgreSQL and Apollo probes informed this design. They did not exercise
+an application, deployment, pgschema rollout or production recovery. The
+[implementation evidence record](implementation.md#existing-evidence) distinguishes
+observed database/library behavior from the tests still required. No measured
+latency, contention envelope or retention-capacity claim is available.

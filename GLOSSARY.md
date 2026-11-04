@@ -5,6 +5,10 @@ and concurrency terminology retains its standard meaning.
 
 ## Graphs and artifacts
 
+**Graph**:
+A registry identity with a history of accepted graph configurations. A graph
+continues to exist when its current configuration contains no subgraphs.
+
 **Subgraph**:
 A GraphQL service's contribution to a federated graph, expressed by its
 Federation schema.
@@ -49,6 +53,10 @@ _Avoid_: Deployed configuration, active configuration.
 **Registry revision**:
 An immutable record of an accepted graph configuration and any artifacts
 generated from it.
+
+**Current registry revision**:
+The latest accepted configuration in a graph's registry history. It does not
+identify the artifact currently active in a gateway.
 
 **Subgraph publication**:
 An accepted version of one subgraph's schema, provenance and artifact-defining
